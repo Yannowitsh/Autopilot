@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <style>
+    :root { --bg: #1b1d22; --panel: #262a31; --text: #e8e6e1; --muted: #9aa0a8; --on: #2e7d32; --pause: #b07400; --off: #555; }
+    body { margin: 0; width: 320px; max-width: 100%; background: var(--bg); color: var(--text); font: 13px system-ui, sans-serif; }
+    main { padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+    h1 { font-size: 15px; margin: 0; }
+    .panel { background: var(--panel); border-radius: 8px; padding: 10px; display: flex; flex-direction: column; gap: 6px; }
+    .panel[hidden] { display: none; }
+    .row { display: flex; justify-content: space-between; gap: 8px; }
+    .muted { color: var(--muted); }
+    button { border: 0; border-radius: 6px; padding: 8px; font-weight: 600; cursor: pointer; color: #fff; background: #3a3f48; }
+    #toggle { font-size: 14px; padding: 10px; }
+    label { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+    input[type=number] { width: 56px; }
+    input[type=text] { width: 100%; box-sizing: border-box; }
+    input, select { background: #14161a; color: var(--text); border: 1px solid #3a3f48; border-radius: 4px; padding: 4px; }
+    .btns { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+    #msg { min-height: 1em; }
+    /* Firefox Android : la popup s'ouvre en plein écran, boutons plus faciles à toucher */
+    @media (pointer: coarse) { body { width: auto; font-size: 15px; } button { padding: 12px; } input[type=number] { width: 72px; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>🤖 Autopilot-DM <small id="version" class="muted" style="font-size:11px;font-weight:400"></small></h1>
+  <div id="update" class="panel" hidden style="border-color:#2b5d8a">
+    <div>🆕 Version <b id="updateVersion"></b> disponible.</div>
+    <div class="btns">
+      <button id="installUpdate" data-tip="Ouvre la page de mise à jour : télécharge la nouvelle version depuis GitHub, l’écrit dans le dossier de l’extension et la recharge. La première fois, Chrome te demande de choisir ce dossier. Tes réglages sont conservés.">⬇️ Installer</button>
+      <button id="openRepo" data-tip="Ouvre la page GitHub de l’extension (code, README, historique des versions).">GitHub</button>
+    </div>
+  </div>
+  <div id="hostPerm" class="panel" hidden style="border-color:#8a2b2b">
+    <div>⚠️ L’extension n’a pas encore accès au site du jeu.</div>
+    <button id="grantHost" data-tip="Firefox demande d’autoriser l’accès à dofusmasters.houk.fr (et Discord, GitHub pour les alertes et les mises à jour). Sans ça, le pilote ne peut pas tourner.">🔓 Autoriser l’accès</button>
+  </div>
+  <button id="toggle" data-tip="Démarre ou arrête le pilote sur l’onglet du jeu actif (ou en ouvre un). Le pilote enchaîne les combats en Auto selon le mode choisi dans les réglages.">…</button>
+
+  <div class="panel">
+    <div class="row"><span class="muted">État<span class="dm-i" data-tip="Ce que le pilote fait en ce moment (combat, pause énergie, attente…).">i</span></span><span id="status">—</span></div>
+    <div class="row"><span class="muted">Énergie<span class="dm-i" data-tip="Dernière énergie lue en jeu, et l’heure de cette lecture. Chaque combat lancé par le pilote en consomme.">i</span></span><span id="energy">—</span></div>
+    <div class="row" id="winRow" hidden><span class="muted">Victoire estimée<span class="dm-i" data-tip="Combat en cours : part de victoires sur 300 simulations de la suite du combat (tes dégâts et soins par tour appris sur tes combats, l’action annoncée et le cycle d’actions de chaque ennemi). En Auto du jeu, le serveur joue tout le combat d’un coup : l’issue s’affiche dès le lancement, avec l’estimation de départ. « Pronostics justes » : estimations de départ qui ont vu juste (≥ 50 % → victoire).">i</span></span><span id="win" style="text-align:right">—</span></div>
+    <div class="row"><span class="muted">Victoires / défaites<span class="dm-i" data-tip="Combats lancés par le pilote depuis la dernière remise à zéro. Les combats faits à la main ne comptent pas.">i</span></span><span id="stats">—</span></div>
+    <div class="row"><span class="muted">Boss de chasse<span class="dm-i" data-tip="Le boss de zone apparaît à heures fixes et reste quelques minutes : présent maintenant, ou heure de sa prochaine apparition.">i</span></span><span id="boss">—</span></div>
+    <div class="btns">
+      <button id="resume" data-tip="Lève tout de suite la pause énergie en cours, sans attendre le seuil de reprise.">Reprendre maintenant</button>
+      <button id="reset" data-tip="Remet le compteur victoires / défaites à zéro.">Remettre stats à 0</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <strong>Modules</strong>
+    <span class="muted">Seuls les modules cochés apparaissent dans le menu 🤖 en jeu et dans les pages du jeu. Enregistré dès que tu coches / décoches.</span>
+    <div id="modules" style="display:flex;flex-direction:column;gap:6px"></div>
+  </div>
+
+  <div class="panel">
+    <strong>Réglages</strong>
+    <label><span>Mode<span class="dm-i" data-tip="Aventure : suit les étapes du Chemin.&#10;Chasse : refait en boucle le groupe le plus dur d’une zone (ou celui que tu as attaqué à la main).&#10;Ascension : étages de boss, débloqués au niveau 200.">i</span></span> <select id="mode">
+      <option value="continuer">Continuer (activité de la page)</option>
+      <option value="aventure">Aventure (Chemin)</option>
+      <option value="chasse">Chasse auto</option>
+      <option value="ascension">Ascension (niv. 200)</option>
+      <option value="dimension">Dimension Écarlate (guilde)</option>
+      <option value="krala">Kralamoure (Faille de guilde)</option>
+      <option value="arene">Arène (chaque adversaire 1 fois)</option>
+      <option value="abysses">Abysses (descente, choix auto)</option>
+    </select></label>
+    <label><span>🔊 Garder actif en arrière-plan<span class="dm-i" data-tip="Joue un son inaudible en boucle tant que le pilote tourne : Firefox ne ralentit plus l’onglet, et sur Android la page continue quand tu passes sur une autre appli ou éteins l’écran (comme une appli de musique ; notification « lecture en cours »). Il faut autoriser la lecture automatique pour le site du jeu : Firefox → Paramètres → Autorisations des sites → Lecture automatique → Autoriser l’audio et la vidéo. À tester : certains téléphones coupent quand même les applis en arrière-plan.">i</span></span> <input type="checkbox" id="keepAlive"></label>
+    <label><span>🛡️ Mode saison<span class="dm-i" data-tip="Saison Héroïque : une défaite contre un boss tue le perso de saison (mort définitive). Coché, le pilote ne fait que de la chasse (monstres, jamais de boss) : Aventure et Ascension refusées, boss de chasse auto désactivé, énergie ignorée (combats gratuits). Une défaite en chasse ne tue pas le perso.">i</span></span> <input type="checkbox" id="seasonMode"></label>
+    <label id="zoneRow"><span>Zone<span class="dm-i" data-tip="Zone de chasse farmée en mode Chasse. La liste montre les zones à ton niveau ; ↻ la recharge.">i</span></span> <span style="display:flex;gap:4px;min-width:0">
+      <select id="huntZone" style="max-width:190px"></select>
+      <button id="reloadZones" data-tip="Recharger la liste des zones de chasse depuis le jeu." style="padding:2px 6px">↻</button>
+    </span></label>
+    <label><span>Webhook Discord<span class="dm-i" data-tip="Adresse d’un webhook de ton serveur Discord (Paramètres du salon → Intégrations → Webhooks). Les alertes y sont envoyées. Laisse vide pour ne rien envoyer.">i</span></span></label>
+    <input type="text" id="webhookUrl" placeholder="https://discord.com/api/webhooks/…">
+    <label><span>Pause si énergie &lt;<span class="dm-i" data-tip="Le pilote se met en pause quand l’énergie passe sous ce seuil, pour ne pas tomber à zéro.">i</span></span> <input type="number" id="minEnergy" min="0"></label>
+    <label><span>Reprise si énergie ≥<span class="dm-i" data-tip="Pendant une pause énergie, le pilote vérifie l’énergie régulièrement et reprend dès qu’elle atteint ce seuil.">i</span></span> <input type="number" id="resumeEnergy" min="0"></label>
+    <label><span>Racheter l’énergie auto (≤ 20 → max)<span class="dm-i" data-tip="Dès 20 d’énergie ou moins, rachète l’énergie jusqu’au maximum avec tes kamas, sans arrêter le farm. Enregistré dès que tu coches.">i</span></span> <input type="checkbox" id="autoBuyEnergy"></label>
+    <label><span>Délai entre combats (s)<span class="dm-i" data-tip="Pause aléatoire entre ces deux valeurs avant chaque relance, pour un rythme plus humain. Quel que soit le réglage, jamais moins de 3,5 s entre deux lancements de combat (limite humaine fixée par le dev : ~3 s par combat).">i</span></span> <span><input type="number" id="delayMin" min="0"> – <input type="number" id="delayMax" min="0"></span></label>
+    <label style="display:none"><span>Combat rapide (sans animation)<span class="dm-i" data-tip="Le serveur joue tout le combat Auto d’un coup : l’animation n’est qu’un replay. Dès que le résultat arrive, la page est rechargée et affiche directement la fin du combat, puis le pilote relance. 2e valeur : temps minimum entre deux lancements de combat (s). Expérimental : des combats très rapprochés sont faciles à repérer côté serveur.">i</span></span> <span><input type="checkbox" id="fastFight"> min <input type="number" id="fastFightMinSec" min="0"></span></label>
+    <label><span>Chasse : essais après défaite<span class="dm-i" data-tip="En chasse (dont les avis de recherche lancés en un clic), nombre de nouveaux essais du même groupe après une défaite, avant d’arrêter le pilote. 0 = arrêt à la première défaite.">i</span></span> <input type="number" id="huntRetries" min="0"></label>
+    <label><span>Page d’erreur : recharger après (s)<span class="dm-i" data-tip="Quand le site affiche une page d’erreur (« Resource Limit Is Reached », Erreur 5xx…) sur l’onglet du pilote, la page est rechargée après ce délai. 2e valeur : au plus un rechargement toutes les N secondes (vaut aussi pour les autres blocages : requête sans réponse, combat figé…).">i</span></span> <span><input type="number" id="errorReloadSec" min="1"> puis <input type="number" id="reloadGapSec" min="5"></span></label>
+    <label><span>Tenter le boss de chasse auto<span class="dm-i" data-tip="Quand le boss de chasse apparaît (toutes les 20 min, 5 min de présence), le pilote finit son combat en cours, tente le boss une fois dans le même onglet (2 énergie), puis reprend son activité. Chasse : si le groupe suivi a été renouvelé pendant le boss, un autre est choisi (nouveau scan en leveling). Jamais en mode saison.">i</span></span> <input type="checkbox" id="bossAuto"></label>
+    <label><span>Roue Bouftou auto<span class="dm-i" data-tip="Pilote actif (même en pause énergie) : tourne la Roue Bouftou dès qu’elle est disponible (un tour toutes les 3 h par compte), sans quitter la page. Lot affiché et envoyé sur Discord. Jamais en mode saison (la roue y est fermée).">i</span></span> <input type="checkbox" id="wheelAuto"></label>
+    <label><span>Auto-équipement : vérif. (min)<span class="dm-i" data-tip="Module Auto-équipement en mode Semi ou Auto : toutes les combien de minutes l’inventaire est vérifié pour équiper (ou proposer) de meilleurs objets. Jamais pendant un combat. 3 par défaut, 0,5 minimum.">i</span></span> <input type="number" id="equipCheckMin" min="0.5" step="0.5"></label>
+    <label><span>Vérif. mises à jour (min)<span class="dm-i" data-tip="Toutes les combien de minutes l’extension regarde sur GitHub si une nouvelle version existe. 0 = jamais automatiquement (le bouton ↻ vérifie à la demande).">i</span></span> <span style="display:flex;gap:4px">
+      <input type="number" id="updateCheckMin" min="0">
+      <button id="checkNow" data-tip="Vérifier tout de suite s’il existe une nouvelle version." style="padding:2px 6px">↻</button>
+    </span></label>
+    <div class="btns">
+      <button id="save" data-tip="Enregistre les réglages de ce bloc (mode, zone, webhook, énergie, délais, mises à jour).">Enregistrer</button>
+      <button id="test" data-tip="Enregistre, puis envoie un message de test sur ton webhook Discord.">Tester Discord</button>
+    </div>
+    <div id="msg" class="muted"></div>
+  </div>
+
+  <div class="panel">
+    <strong>Notifications Discord</strong>
+    <span class="muted">Enregistré dès que tu coches / décoches.</span>
+    <div id="notifs" style="display:flex;flex-direction:column;gap:6px"></div>
+    <label><span>Pré-alerte boss (min avant, 0 = non)<span class="dm-i" data-tip="Envoie aussi un message N minutes avant l’apparition du boss de chasse. 0 = pas de pré-alerte.">i</span></span> <input type="number" id="bossPreAlertMin" min="0"></label>
+  </div>
+
+  <div class="panel">
+    <strong>Synchro des mesures<span class="dm-i" data-tip="Partage les combats de chasse enregistrés (📈 Rentabilité des zones) avec tes amis via ton Worker Cloudflare (dossier sync-worker/ du dépôt). Toutes les 5 min : tes nouveaux combats sont envoyés, ceux des autres reçus. Ils servent au classement (XP ramenée à 0 de Sagesse, drops recalculés à ta Prospection) ; la durée des combats reste la tienne.">i</span></strong>
+    <label><span>Adresse du Worker</span></label>
+    <input type="text" id="syncUrl" placeholder="https://dm-sync.<ton-compte>.workers.dev">
+    <label><span>Clé partagée<span class="dm-i" data-tip="La même clé que le secret SYNC_KEY du Worker, identique chez tous ceux qui partagent.">i</span></span></label>
+    <input type="password" id="syncKey" placeholder="clé (SYNC_KEY)">
+    <div class="btns">
+      <button id="syncNow" data-tip="Enregistre l’adresse et la clé, puis synchronise tout de suite.">🔄 Enregistrer + synchroniser</button>
+    </div>
+    <div id="syncMsg" class="muted">—</div>
+    <label><span>Enregistrer mes combats en ligne<span class="dm-i" data-tip="À chaque fin de combat, envoie au Worker (même adresse et clé) le combat complet : stats de tous les combattants, journal des coups, cartes jouées, décisions de l’Auto par poids (main, PA et PV à chaque action, suite de cartes retenue) et photo du build (fiche, prestige, Bouclier de forge, équipement porté et fusions). Sert à vérifier et affiner le calcul des dégâts. Seuls ceux qui ont la clé peuvent les lire. Enregistré dès que tu coches.">i</span></span> <input type="checkbox" id="combatUpload"></label>
+    <div id="combatMsg" class="muted"></div>
+  </div>
+
+  <div class="panel">
+    <strong>Journal (débogage)<span class="dm-i" data-tip="Historique technique de ce que fait l’extension. En cas de problème, copie-le et colle-le à la personne qui t’aide. Ton webhook n’y figure pas.">i</span></strong>
+    <span class="muted" id="logInfo">—</span>
+    <div class="btns">
+      <button id="logCopy">📋 Copier le journal</button>
+      <button id="logClear">Vider</button>
+    </div>
+  </div>
+</main>
+<script src="shared.js"></script>
+<script src="popup.js"></script>
+</body>
+</html>

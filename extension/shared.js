@@ -1,0 +1,337 @@
+// Code partagé entre le service worker, le content script et la popup.
+const DM = {
+  ORIGIN: 'https://rpgmasters.houk.fr',
+
+  // Mises à jour : le manifest du dépôt GitHub public fait foi (vérifié toutes les `updateCheckMin` minutes).
+  REPO: 'OWNER/Autopilot-DM',
+  get UPDATE_MANIFEST() { return `https://raw.githubusercontent.com/${DM.REPO}/main/extension/manifest.json`; },
+  get REPO_URL() { return `https://github.com/${DM.REPO}`; },
+  // Firefox (ordinateur ou Android) : pas de mise à jour par dossier (File System Access) ni d'échange entre comptes.
+  get IS_FIREFOX() { return chrome.runtime.getURL('').startsWith('moz-extension:'); },
+  get IS_MOBILE() { return /Android|Mobi/i.test(navigator.userAgent); },
+  // Firefox : la version signée (.xpi) est publiée dans les releases GitHub ; Firefox la met aussi à jour tout seul.
+  get RELEASES_URL() { return `https://github.com/${DM.REPO}/releases/latest`; },
+  // « 1.32.0 » > « 1.31.4 » ?
+  isNewer(a, b) {
+    const pa = String(a).split('.').map(Number), pb = String(b).split('.').map(Number);
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+      if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) > (pb[i] || 0);
+    }
+    return false;
+  },
+  // Version plus récente disponible sur GitHub (null si à jour).
+  pendingUpdate(s) {
+    const v = s.updateVersion;
+    return v && DM.isNewer(v, chrome.runtime.getManifest().version) ? v : null;
+  },
+
+  DEFAULTS: {
+    enabled: false,
+    webhookUrl: '',
+    minEnergy: 5,        // pause sous ce seuil
+    resumeEnergy: 20,    // reprise à partir de ce seuil
+    autoBuyEnergy: false, // dès 20 d'énergie ou moins : rachète l'énergie au max (kamas), le farm ne s'arrête pas
+    delayMin: 3,         // secondes entre deux combats
+    delayMax: 8,
+    fastFight: false,    // combat rapide : dès que le serveur a renvoyé le résultat, rechargement (pas d'animation)
+    fastFightMinSec: 5,  // combat rapide : au moins N s entre deux lancements de combat
+    fightEngine: 'game', // 'game' (bouton Auto du site) ou 'weights' (le pilote joue les cartes selon cfg.cardWeights)
+    cardWeights: {},     // auto par poids : { idCarte | 'w' (arme) : { w: 0-100, every: N tours } }
+    autoHealBelow: 70,   // auto par poids : cartes de soin jouées seulement sous ce % de PV
+    autoActMin: 0.8,     // auto par poids : pause entre deux actions (s)
+    autoActMax: 1.5,
+    humanPlay: false,    // auto par poids : cliquer les cartes dans la page (animations visibles, pas de rechargement)
+    equipCheckMin: 3,    // auto-équipement (Semi / Auto) : vérification de l'inventaire toutes les N minutes
+    modules: {},         // modules désactivés dans la popup : { clé: false } (absent = activé)
+    huntRetries: 3,      // chasse (avis de recherche…) : nouveaux essais après une défaite avant arrêt
+    errorReloadSec: 5,   // page d'erreur du site (508 « Resource Limit Is Reached », 5xx…) : rechargée après N s
+    reloadGapSec: 30,    // anti-blocage : au plus un rechargement toutes les N s
+    bossAlerts: true,    // alerte Discord quand le boss de chasse apparaît (indépendant du ON/OFF)
+    notifyWanted: true,  // notifications Discord par type (voir DM.NOTIF)
+    notifyDefeat: true,
+    notifyEnergy: true,
+    notifyErrors: true,
+    notifyDrop: true,
+    notifySample: true,
+    notifyLevel: true,
+    levelStopAt200: true, // 📈 Leveling : pilote arrêté au niveau 200
+    levelNotifyEvery: 0,  // 📈 Leveling : notification tous les N niveaux (0 = seulement au début et à 200)
+    wantedMinPerGroup: 1, // avis de recherche : nb minimum de monstres recherchés dans le même groupe
+    bossPreAlertMin: 0,  // pré-alerte N minutes avant (0 = désactivé)
+    wheelAuto: true,     // pilote actif : tourne la Roue Bouftou dès qu'elle est prête (toutes les 3 h, pas en saison)
+    notifyWheel: true,
+    bossAuto: true,      // pilote actif : tente le boss de chasse à son apparition (même onglet, après le combat en cours), puis reprend l'activité
+    keepAlive: false,    // son quasi muet en boucle pendant le pilote : onglet actif en arrière-plan (Android : Firefox pas mis en pause)
+    seasonMode: false,   // saison Héroïque : chasse uniquement, jamais de boss (une défaite contre un boss tue le perso)
+    activity: 'continuer',   // choix d'activité : 'continuer' (celle de la page au démarrage du pilote) ou un mode fixe
+    dimDiff: 2,          // Dimension Écarlate : difficulté d'une nouvelle descente (0 Rosée … 4 Sanguinaire ; 2 Cramoisi = référence)
+    dimRestart: true,    // Dimension : nouvelle descente (20 énergie) après la fin de la précédente
+    archiPerGroup: 5,    // 👑 Farm archi : combats sur chaque groupe avant de rescanner la tranche
+    arenaStock: false,   // Arène : utiliser aussi les tickets en stock (coffres) quand ceux du jour sont épuisés
+    mode: 'aventure',    // 'aventure' (Chemin), 'chasse' (groupe le plus dur d'une zone en boucle) ou 'ascension' (niv. 200)
+    huntZone: null,      // id de zone (/chasse?zone=…)
+    huntGroup: null,     // n° de groupe choisi à la main en jeu (null = le plus dur)
+    huntZoneName: '',
+    combatUpload: true,
+    ascAutoDeck: false,
+    ascAutoBuild: false, // Ascension (pilote) : build de survie (objets possédés, vrais tiers) équipé avant chaque essai
+    ascEngine: 'best',   // Ascension : 'best' (celui qui gagne le plus à l'étage), 'game' (Auto du jeu) ou 'ours' (notre moteur)  // Ascension (pilote) : deck conseillé enregistré dans le Deck 6 et activé avant chaque étage  // enregistre chaque combat terminé (stats, build, journal des coups) sur le Worker de synchro
+    updateCheckMin: 180, // vérification d'une nouvelle version sur GitHub, en minutes (0 = jamais automatiquement)
+    wins: 0,
+    losses: 0,
+  },
+
+  // Modules activables depuis la popup de l'extension ; un module désactivé disparaît du menu 🤖 et des pages du jeu.
+  MODULES: [
+    { key: 'weights', label: '🎯 Auto par poids', tip: 'Choix du mode de combat (Auto du jeu / Auto par poids) et réglage du poids des cartes, aussi depuis la page /deck. Désactivé : le pilote utilise l’Auto du jeu.' },
+    { key: 'fusion', label: '✨ Fusion', tip: 'Fusion des doublons en cascade, et bouton ⚡ Tout fusionner sur la fiche d’objet de /personnage.' },
+    { key: 'equip', label: '🛡️ Auto-équipement', tip: 'Équipement automatique des meilleurs objets selon tes caractéristiques (Off / Semi / Auto).' },
+    { key: 'spells', label: '📚 Tierlist des sorts', tip: 'Classement des sorts de ta collection par dégâts.' },
+    { key: 'build', label: '🧬 Optimiseur de build', tip: 'Recherche du meilleur équipement, builds enregistrés et bulle ❤️ Favoris.' },
+    { key: 'wanted', label: '🎯 Avis de recherche', tip: 'Scan des zones de chasse pour trouver les monstres recherchés, et surlignage dans les zones.' },
+    { key: 'trade', label: '🔁 Échange entre comptes', tip: 'Boutons 🔁 Échanger / ➕ File et file d’échange sur /personnage et l’HDV.' },
+  ],
+  modOn(s, key) {
+    return s?.modules?.[key] !== false;
+  },
+
+  // Raretés du jeu : champ « r » des objets (0 = Commun … 5 = Légendaire), même ordre que le filtre de /personnage.
+  RARITIES: ['Commun', 'Peu commun', 'Rare', 'Épique', 'Mythique', 'Légendaire'],
+
+  // Types de notifications Discord, activables un par un dans la popup (clé = réglage dans le stockage).
+  NOTIF: [
+    { kind: 'wanted', key: 'notifyWanted', label: '🎯 Avis de recherche trouvés',
+      tip: 'Message dès que le scan des zones trouve un groupe contenant un monstre recherché, avec un lien « attaque directe ».' },
+    { kind: 'boss', key: 'bossAlerts', label: '🐉 Boss de chasse (apparition)',
+      tip: 'Message quand le boss de zone apparaît (et la pré-alerte si elle est réglée). Fonctionne même pilote arrêté.' },
+    { kind: 'defeat', key: 'notifyDefeat', label: '❌ Combat perdu (pilote arrêté)',
+      tip: 'Message quand le pilote s’arrête après une défaite : immédiatement en chasse, après plusieurs défaites d’affilée en aventure.' },
+    { kind: 'energy', key: 'notifyEnergy', label: '🔋 Énergie basse / reprise',
+      tip: 'Message quand le pilote se met en pause faute d’énergie, puis quand il reprend.' },
+    { kind: 'drop', key: 'notifyDrop', label: '🐉 Farm de drop',
+      tip: 'Message à chaque objet voulu obtenu, quand une zone est abandonnée (5 défaites), et à la fin du farm (tout droppé, ou arrêt avec la raison).' },
+    { kind: 'sample', key: 'notifySample', label: '🧪 Échantillonnage des zones',
+      tip: 'Message quand une zone atteint l’objectif de combats, quand une zone est abandonnée (3 défaites), et à la fin.' },
+    { kind: 'level', key: 'notifyLevel', label: '📈 Leveling',
+      tip: 'Message au lancement, à l’arrivée au niveau 200 (avec le temps mis et la moyenne), à l’arrêt (défaites), et tous les N niveaux si réglé dans le menu 🤖.' },
+    { kind: 'wheel', key: 'notifyWheel', label: '🎡 Roue Bouftou',
+      tip: 'Message à chaque tour de roue automatique, avec le lot gagné (et le jackpot).' },
+    { kind: 'errors', key: 'notifyErrors', label: '⚠️ Problèmes (déconnexion, énergie illisible)',
+      tip: 'Message en cas de souci technique : déconnexion du jeu, énergie impossible à lire, etc.' },
+  ],
+
+  // Valeurs observées : un boss toutes les 20 min, calé sur l'heure (xx:00, xx:20, xx:40), présent 5 min.
+  BOSS_FALLBACK: { anchor: 0, period: 20 * 60000, duration: 5 * 60000, name: null },
+
+  // Extrait les infos du boss de zone depuis le HTML de /chasse (HTML SSR + payload RSC échappé).
+  parseBossInfo(html) {
+    const s = html.replace(/\\"/g, '"');
+    const start = s.search(/boss de zone/i);
+    if (start < 0) return null;
+    const zone = s.slice(Math.max(0, start - 3000), start + 6000);
+    const info = { ...DM.BOSS_FALLBACK };
+
+    const pd = s.match(/toutes les\D{0,40}?(\d+)\D{0,40}?minutes et reste\D{0,40}?(\d+)/);
+    if (pd) { info.period = +pd[1] * 60000; info.duration = +pd[2] * 60000; }
+
+    const name = zone.match(/title text-xl leading-tight"\s*,\s*"children"\s*:\s*"([^"]+)"/)
+      || zone.match(/class="title text-xl leading-tight"[^>]*>([^<]+)</);
+    if (name) info.name = name[1];
+
+    // Compte à rebours du boss (« Arrive dans » / « Repart dans ») : dans le payload RSC, loin du texte rendu
+    // de la section (v2 du site) → cherché dans toute la page, les autres comptes à rebours ont un autre libellé.
+    let found = false;
+    for (const m of s.matchAll(/"to"\s*:\s*(\d{12,14})\s*,\s*"prefix"\s*:\s*"((?:Arrive|Repart)[^"]*)"/gi)) {
+      const to = +m[1];
+      info.anchor = /arrive/i.test(m[2]) ? to : to - info.duration;
+      info.timerPrefix = m[2];
+      found = true;
+      break;
+    }
+    info.parsedTimer = found;
+    return info;
+  },
+
+  // État du boss à l'instant `now` : actif ? apparu quand ? part quand ? prochain quand ?
+  bossStatus(info, now = Date.now()) {
+    const b = { ...DM.BOSS_FALLBACK, ...(info || {}) };
+    const cur = b.anchor + Math.floor((now - b.anchor) / b.period) * b.period;
+    const active = now - cur < b.duration;
+    return { active, spawnAt: cur, endsAt: cur + b.duration, nextAt: cur + b.period, name: b.name, duration: b.duration };
+  },
+
+  // fetch avec délai maximal : une requête qui ne répond jamais ne doit pas bloquer le pilote.
+  // Journal de débogage partagé (stockage local, LOG_MAX dernières lignes), copiable depuis la popup.
+  LOG_MAX: 400,
+  async log(...parts) {
+    const t = new Date().toLocaleTimeString('fr-FR');
+    const line = `${t} ${parts.map((p) => (typeof p === 'string' ? p : JSON.stringify(p))).join(' ')}`;
+    console.info('[Pilote auto]', line);
+    // écritures en file : deux lignes rapprochées ne s'écrasent pas (lecture → ajout → écriture)
+    DM.logQueue = (DM.logQueue || Promise.resolve()).then(async () => {
+      try {
+        const { debugLog = [] } = await chrome.storage.local.get('debugLog');
+        debugLog.push(line);
+        await chrome.storage.local.set({ debugLog: debugLog.slice(-DM.LOG_MAX) });
+      } catch { /* contexte d'extension invalidé */ }
+    });
+    return DM.logQueue;
+  },
+
+  // ---------- Bulles d'information au survol ----------
+  // Tout élément [data-tip] affiche une bulle explicative au survol ; DM.tip(texte) produit une pastille « i » à insérer.
+  // root : document ou shadow root à surveiller ; la bulle est en position fixe, recadrée dans la fenêtre.
+  tipAttr: (s) => String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;'),
+  tip(text) {
+    return `<span class="dm-i" data-tip="${DM.tipAttr(text)}">i</span>`;
+  },
+  installTips(root = document) {
+    const mount = root === document ? document.body : root;
+    if (!mount || mount.querySelector?.(':scope > .dm-tip')) return;
+    const style = document.createElement('style');
+    style.className = 'dm-tip-style';
+    style.textContent = `
+      .dm-i { display: inline-grid; place-items: center; width: 14px; height: 14px; margin-left: 5px; border-radius: 50%;
+        background: #3a3f48; color: #cfd3d8; font: italic 700 10px/1 Georgia, serif; cursor: help; vertical-align: middle;
+        flex: none; user-select: none; }
+      .dm-i:hover { background: #2b5d8a; color: #fff; }
+      .dm-tip { position: fixed; z-index: 2147483647; max-width: 260px; padding: 7px 9px; border-radius: 8px;
+        background: #0f1114; color: #e8e6e1; border: 1px solid #3a3f48; box-shadow: 0 4px 14px rgba(0,0,0,.6);
+        font: 12px/1.4 system-ui, sans-serif; white-space: pre-line; pointer-events: none; display: none; text-align: left; }`;
+    const tip = document.createElement('div');
+    tip.className = 'dm-tip';
+    mount.append(style, tip);
+    const show = (el) => {
+      tip.textContent = el.dataset.tip;
+      tip.style.display = 'block';
+      const r = el.getBoundingClientRect(), w = tip.offsetWidth, h = tip.offsetHeight;
+      const x = Math.max(6, Math.min(r.left + r.width / 2 - w / 2, innerWidth - w - 6));
+      let y = r.bottom + 6;
+      if (y + h > innerHeight - 6) y = Math.max(6, r.top - h - 6);   // pas la place dessous : au-dessus
+      tip.style.left = `${x}px`;
+      tip.style.top = `${y}px`;
+    };
+    root.addEventListener('mouseover', (e) => {
+      const el = e.target.closest?.('[data-tip]');
+      if (el) show(el); else tip.style.display = 'none';
+    });
+    root.addEventListener('mouseout', (e) => { if (!e.relatedTarget?.closest?.('[data-tip]')) tip.style.display = 'none'; });
+    root.addEventListener('scroll', () => { tip.style.display = 'none'; }, true);
+    // clic sur la pastille « i » dans un <label> / <summary> : ne coche rien, n'ouvre rien
+    root.addEventListener('click', (e) => { if (e.target.closest?.('.dm-i')) e.preventDefault(); }, true);
+  },
+
+  fetchT(url, opts = {}, ms = 20000) {
+    return fetch(url, { ...opts, signal: AbortSignal.timeout(ms) });
+  },
+
+  // Page de départ du pilote selon le mode.
+  // Difficultés de la Dimension Écarlate (page /guilde/dimension, ids 0 à 4)
+  DIM_DIFFS: ['Rosée', 'Rubis', 'Cramoisi', 'Pourpre', 'Sanguinaire'],
+
+  homePath(s) {
+    if (s.mode === 'ascension') return '/ascension';
+    if (s.mode === 'dimension') return '/guilde/dimension';
+    if (s.mode === 'krala') return '/guilde';
+    if (s.mode === 'arene') return '/arene';
+    if (s.mode === 'abysses') return '/abysses';
+    return s.mode === 'chasse' && s.huntZone ? `/chasse?zone=${s.huntZone}` : '/aventure';
+  },
+
+  // % de victoire estimé du combat (content/winrate.js) : texte de la popup et du menu 🤖, '' si rien de récent (5 min).
+  winText(s) {
+    const e = s.winEst;
+    if (!e || Date.now() - (e.at || 0) > 5 * 60000) return '';
+    const c = e.acct && s.winModel?.[e.acct]?.calib;
+    const rel = c?.n >= 5 ? ` · pronostics justes ${Math.round((c.ok / c.n) * 100)} % (${c.n})` : '';
+    if (e.done) return `${e.done === 'won' ? '✔ victoire' : '✖ défaite'}${e.first != null ? ` (estimée ${e.first} %)` : ''}${rel}`;
+    return `🎲 ${e.pct} %${e.learned ? '' : ' (apprentissage…)'}${rel}`;
+  },
+
+  // Libellé court de l'activité du pilote (bouton Démarrer…).
+  modeLabel(s) {
+    if ((s.seasonMode || s.seasonPilot) && !(s.mode === 'chasse' && s.huntZone)) return '🛡️ saison : choisis une zone de chasse';
+    if (s.mode === 'ascension') return 'ascension';
+    if (s.mode === 'dimension') return `Dimension Écarlate (${DM.DIM_DIFFS[+s.dimDiff] ?? DM.DIM_DIFFS[2]})`;
+    if (s.mode === 'krala') return 'Kralamoure';
+    if (s.mode === 'arene') return 'Arène';
+    if (s.mode === 'abysses') return 'Abysses';
+    return s.mode === 'chasse' && s.huntZone ? `chasse : ${s.huntZoneName || 'zone ' + s.huntZone}${s.huntGroup ? ` · G${s.huntGroup}` : ''}` : 'aventure';
+  },
+
+  // Liste des zones de chasse lue sur /chasse.
+  // all = false : zones proposées à ton niveau, gardées en cache pour le choix de zone ;
+  // all = true  : toutes les zones du jeu (~220), pour le scan des avis de recherche.
+  // v2 du site : composant ZoneBrowser, props { level, mine: [ids à ton niveau], zones: [{ id, n, area, min, max }] }
+  // dans le payload RSC (la page n'affiche qu'une partie des zones). Sinon, liens « /chasse?zone=… » de la page.
+  // Utilise DOMParser : popup ou content script uniquement (pas le service worker).
+  async fetchZones({ all = false } = {}) {
+    // toutes les zones : /chasse?toutes=1 (/chasse seul ne liste que celles à ton niveau depuis que le site ne donne plus
+    // les props du ZoneBrowser : le scan « archis seuls » croisait 54 zones de niveau 190–200 avec des zones d'archis bas niveau)
+    const r = await DM.fetchT(DM.ORIGIN + (all ? '/chasse?toutes=1' : '/chasse'), { credentials: 'include', cache: 'no-store' });
+    if (r.redirected && /connexion/.test(r.url)) throw new Error('déconnecté');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const html = await r.text();
+    const browser = DM.zoneBrowserProps(html);
+    if (browser) {
+      const mid = (z) => (z.min + z.max) / 2;
+      const mine = new Set(browser.mine || []);
+      const list = all ? browser.zones
+        : browser.zones.filter((z) => mine.has(z.id)).sort((a, b) => Math.abs(mid(a) - browser.level) - Math.abs(mid(b) - browser.level));
+      const zones = list.map((z) => ({ id: z.id, name: z.n, region: z.area || '', lvlMin: z.min ?? null, lvlMax: z.max ?? null,
+        label: z.min != null ? `${z.n} (${z.min}–${z.max})` : z.n }));
+      if (zones.length) {
+        if (!all) await chrome.storage.local.set({ huntZones: zones });
+        return zones;
+      }
+    }
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const zones = [];
+    for (const a of doc.querySelectorAll('a[href*="/chasse?zone="]')) {
+      const id = +new URL(a.getAttribute('href'), DM.ORIGIN).searchParams.get('zone');
+      if (!id || zones.some((z) => z.id === id)) continue;
+      const name = a.querySelector('.font-bold')?.textContent.trim() || `Zone ${id}`;
+      const region = a.querySelector('.text-dim')?.textContent.trim() || '';
+      const lvl = a.textContent.match(/Niveau\s*(\d+)\s*–\s*(\d+)/);
+      const req = a.textContent.match(/Niveau\s*(\d+)\s*requis/);   // zone verrouillée : niveau du perso requis
+      zones.push({ id, name, region, lvlMin: lvl ? +lvl[1] : null, lvlMax: lvl ? +lvl[2] : null, lvlReq: req ? +req[1] : null,
+        label: lvl ? `${name} (${lvl[1]}–${lvl[2]})` : name });
+    }
+    if (!zones.length) throw new Error('aucune zone trouvée');
+    if (!all) await chrome.storage.local.set({ huntZones: zones });
+    return zones;
+  },
+
+  // Props du ZoneBrowser de /chasse (objet contenant "mine" et "zones") lues dans le payload RSC de la page, ou null.
+  zoneBrowserProps(html) {
+    let flight = '';
+    for (const m of html.matchAll(/self\.__next_f\.push\(\[1,("(?:[^"\\]|\\.)*")\]\)/g)) {
+      try { flight += JSON.parse(m[1]); } catch { /* morceau illisible */ }
+    }
+    const start = flight.search(/\{"level":\d+,"mine":\[/);
+    if (start < 0) return null;
+    // fin de l'objet : accolades équilibrées, hors chaînes
+    let depth = 0, inStr = false;
+    for (let i = start; i < flight.length; i++) {
+      const c = flight[i];
+      if (inStr) { if (c === '\\') i++; else if (c === '"') inStr = false; continue; }
+      if (c === '"') inStr = true;
+      else if (c === '{' || c === '[') depth++;
+      else if ((c === '}' || c === ']') && --depth === 0) {
+        try {
+          const p = JSON.parse(flight.slice(start, i + 1));
+          return Array.isArray(p.zones) ? p : null;
+        } catch { return null; }
+      }
+    }
+    return null;
+  },
+
+  hhmm(ts) {
+    return new Date(ts).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+  },
+
+  async getAll() {
+    return Object.assign({}, DM.DEFAULTS, await chrome.storage.local.get(null));
+  },
+};

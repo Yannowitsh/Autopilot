@@ -1,0 +1,90 @@
+{
+  "manifest_version": 3,
+  "name": "Autopilot-DM",
+  "version": "2.40.1",
+  "description": "Enchaîne l’Aventure ou la chasse, résout la vérification de présence, surveille l’énergie, échange des objets entre deux comptes via l’HDV et alerte sur Discord (défaite, énergie basse, boss de chasse).",
+  "permissions": ["storage", "alarms"],
+  "incognito": "spanning",
+  "host_permissions": [
+    "https://rpgmasters.houk.fr/*",
+    "https://dofusmasters.houk.fr/*",
+    "https://discord.com/*",
+    "https://discordapp.com/*",
+    "https://raw.githubusercontent.com/*",
+    "https://api.github.com/*",
+    "https://*.workers.dev/*"
+  ],
+  "optional_host_permissions": ["https://*/*"],
+  "background": {
+    "service_worker": "background.js",
+    "scripts": ["shared.js", "background.js"]
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "autopilot-dm@example",
+      "strict_min_version": "140.0",
+      "data_collection_permissions": { "required": ["none"] },
+      "update_url": "https://github.com/OWNER/Autopilot-DM/releases/latest/download/updates.json"
+    },
+    "gecko_android": { "strict_min_version": "142.0" }
+  },
+  "options_ui": { "page": "popup.html", "open_in_tab": true },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Autopilot-DM"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://rpgmasters.houk.fr/*"
+      ],
+      "js": [
+        "netwatch.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://rpgmasters.houk.fr/*"
+      ],
+      "js": [
+        "shared.js",
+        "wanted.js",
+        "archi.js",
+        "content/core.js",
+        "content/energy.js",
+        "content/loop.js",
+        "content/inventory.js",
+        "content/trade.js",
+        "content/trade-ui.js",
+        "content/fusion-equip.js",
+        "content/fight.js",
+        "content/hunt.js",
+        "content/spells.js",
+        "content/classes.js",
+        "content/build-data.js",
+        "content/build-solver.js",
+        "content/build-ui.js",
+        "content/dropfarm.js",
+        "content/sample.js",
+        "content/leveling.js",
+        "content/archifarm.js",
+        "content/orbfarm.js",
+        "content/archidrops.js",
+        "content/combatrec.js",
+        "content/selfcheck.js",
+        "content/weights.js",
+        "content/ascmech.js",
+        "content/ascdeck.js",
+        "content/abyss.js",
+        "content/winrate.js",
+        "content/claims.js",
+        "content/ui.js",
+        "content/ui-menus.js",
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

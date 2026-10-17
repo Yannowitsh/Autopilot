@@ -1,0 +1,440 @@
+// Chrome : service worker (shared.js importé ici). Firefox : page d'arrière-plan, shared.js est déjà chargé par le manifest.
+if (typeof importScripts === 'function') importScripts('shared.js');
+
+const BOSS_REFRESH_MS = 10 * 60000;
+
+// kind : type de notification (DM.NOTIF) ; ignoré si désactivé dans les réglages. Sans kind (test) : toujours envoyé.
+async function discord(text, embeds, kind) {
+  const s = await DM.getAll();
+  const { webhookUrl } = s;
+  const type = kind && DM.NOTIF.find((n) => n.kind === kind);
+  if (type && s[type.key] === false) return { ok: true, skipped: true };
+  if (!webhookUrl) return { ok: false, error: 'Webhook Discord non configuré' };
+  try {
+    const r = await DM.fetchT(webhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'Autopilot-DM', content: text, ...(embeds ? { embeds } : {}) }),
+    });
+    return r.ok ? { ok: true } : { ok: false, error: `HTTP ${r.status}` };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+async function refreshBoss() {
+  try {
+    const r = await DM.fetchT(DM.ORIGIN + '/chasse', { credentials: 'include', cache: 'no-store' });
+    if (!r.ok) return;
+    const info = DM.parseBossInfo(await r.text());
+    if (info) await chrome.storage.local.set({ bossInfo: { ...info, fetchedAt: Date.now() } });
+  } catch (e) { /* hors ligne ou déconnecté : on garde la grille par défaut */ }
+}
+
+async function updateBadge() {
+  const s = await DM.getAll();
+  const text = !s.enabled ? '' : s.paused ? 'II' : 'ON';
+  try {   // Firefox Android : pas de badge sur l'icône
+    await chrome.action.setBadgeText({ text });
+    await chrome.action.setBadgeBackgroundColor({ color: s.paused ? '#d18b00' : '#2e9e44' });
+  } catch { /* badge indisponible */ }
+}
+
+async function bossCheck() {
+  const s = await DM.getAll();
+  if (!s.bossInfo || Date.now() - (s.bossInfo.fetchedAt || 0) > BOSS_REFRESH_MS) await refreshBoss();
+  const { bossInfo, bossPreAlertMin, bossAlertedFor, bossPreAlertedFor } = await DM.getAll();
+
+  const now = Date.now();
+  const st = DM.bossStatus(bossInfo, now);
+  const name = st.name || 'Boss de chasse';
+  await bossAutoCheck(st, now);
+
+  if (st.active && bossAlertedFor !== st.spawnAt) {
+    await chrome.storage.local.set({ bossAlertedFor: st.spawnAt });
+    await discord(`🐉 **${name}** est apparu ! Disponible jusqu'à **${DM.hhmm(st.endsAt)}** (un seul essai).\n${DM.ORIGIN}/chasse`, undefined, 'boss');
+  } else if (!st.active && bossPreAlertMin > 0 && st.nextAt - now <= bossPreAlertMin * 60000 && bossPreAlertedFor !== st.nextAt) {
+    await chrome.storage.local.set({ bossPreAlertedFor: st.nextAt });
+    await discord(`⏳ **${name}** arrive à ${DM.hhmm(st.nextAt)}.`, undefined, 'boss');
+  }
+}
+
+// ---------- Boss de chasse automatique ----------
+// bossRun.phase : 'waiting' (le pilote finit son combat sans relancer) → 'fighting' (même onglet : /chasse, boss,
+// puis retour à l'activité, voir content/core.js) → supprimé par « bossDone ».
+const BOSS_FIGHT_MAX_MS = 8 * 60000;   // sécurité : essai abandonné au-delà
+const BOSS_MIN_LEFT_MS = 45 * 1000;    // inutile de partir si le boss s'en va dans moins de 45 s
+
+async function bossAutoCheck(st, now) {
+  const s = await DM.getAll();
+  const run = s.bossRun;
+  if (run?.phase === 'waiting' && now > run.endsAt) {   // le combat en cours n'a pas fini à temps : boss manqué
+    await chrome.storage.local.set({ bossRun: null });
+    return;
+  }
+  if (run?.phase === 'fighting' && now - run.startedAt > BOSS_FIGHT_MAX_MS) {
+    await bossFinish('abandonné (délai dépassé)');
+    if (s.enabled && s.ownerTabId != null) chrome.tabs.update(s.ownerTabId, { url: DM.ORIGIN + DM.homePath(s) }).catch(() => {});
+    return;
+  }
+  if (run || !s.enabled || s.paused || s.bossAuto === false || s.seasonMode || s.seasonPilot || !st.active) return;   // saison : un boss tue le perso
+  if (s.bossTriedFor === st.spawnAt || st.endsAt - now < BOSS_MIN_LEFT_MS) return;
+  await chrome.storage.local.set({
+    bossTriedFor: st.spawnAt,   // un seul essai par apparition
+    bossRun: { phase: 'waiting', spawnAt: st.spawnAt, endsAt: st.endsAt, name: st.name },
+  });
+  if (s.ownerTabId != null) chrome.tabs.sendMessage(s.ownerTabId, { type: 'tick' }).catch(() => {});
+}
+
+// Fin de l'essai (l'onglet revient lui-même à son activité).
+async function bossFinish(result) {
+  const { bossRun: run } = await DM.getAll();
+  if (!run) return;
+  await chrome.storage.local.set({ bossRun: null, status: `Boss : ${result} — reprise de l’activité…` });
+  if (result) await discord(`🐉 **${run.name || 'Boss de chasse'}** : ${result}.`, undefined, 'boss');
+}
+
+// ---------- Achat d'énergie dans un onglet à part ----------
+// energyBuy : { tabId, farmTabId, at } pendant l'achat. Au retour (« buyDone ») : fermeture de l'onglet d'achat,
+// pause levée et rechargement de l'onglet du pilote sur sa page d'accueil (relance propre, même s'il était en combat).
+const BUY_TAB_MAX_MS = 2 * 60000;
+
+async function buyStart(farmTabId) {
+  const s = await DM.getAll();
+  if (!s.enabled || !s.autoBuyEnergy) { DM.log(`achat[sw]: refusé (pilote ${s.enabled ? 'ON' : 'OFF'}, achat auto ${s.autoBuyEnergy ? 'ON' : 'OFF'})`); return false; }
+  if (s.energyBuy && Date.now() - s.energyBuy.at < BUY_TAB_MAX_MS) return true;
+  const tab = await chrome.tabs.create({ url: DM.ORIGIN + '/jeu?dmBuy=1', active: false });
+  await chrome.storage.local.set({ energyBuy: { tabId: tab.id, farmTabId, at: Date.now() } });
+  DM.log(`achat[sw]: onglet d’achat ${tab.id} ouvert pour l’onglet ${farmTabId}`);
+  return true;
+}
+
+async function buyDone(res, senderTabId) {
+  const s = await DM.getAll();
+  const run = s.energyBuy;
+  DM.log(`achat[sw]: résultat de l’onglet ${senderTabId}`, res, 'attendu', run);
+  if (!run || run.tabId !== senderTabId) return;
+  await chrome.storage.local.set({ energyBuy: null });
+  setTimeout(() => chrome.tabs.remove(run.tabId).catch(() => {}), 1500);
+  if (!res.ok) {
+    // raison « normale » (prix, réserve, plafond) : signalée une fois, pas à chaque nouvel essai
+    if (res.soft && s.buySoftReason === res.error) return;
+    await chrome.storage.local.set({ buySoftReason: res.soft ? res.error : null });
+    await discord(res.soft
+      ? `🔋 Achat d’énergie auto non fait : ${res.error}. Le pilote continue avec l’énergie restante.`
+      : `⚠️ Achat d’énergie auto échoué (${res.error}). Nouvel essai dans 10 min.`, undefined, res.soft ? 'energy' : 'errors');
+    return;
+  }
+  await chrome.storage.local.set({
+    energy: res.energy, energyAt: Date.now(), pauseReason: null, paused: false, buyNextTry: 0, buySoftReason: null,
+    status: `🛒 ${res.n} énergie achetée — relance…`,
+  });
+  await discord(`🛒 **${res.n} énergie** achetée pour ${res.cost.toLocaleString('fr-FR')} K → ${res.energy}/${res.max}`
+    + ` (reste ~${res.kamas.toLocaleString('fr-FR')} K). Le pilote reprend.`, undefined, 'energy');
+  if (s.enabled && s.ownerTabId === run.farmTabId) {
+    await chrome.tabs.update(run.farmTabId, { url: DM.ORIGIN + DM.homePath(s) })
+      .then(() => DM.log(`achat[sw]: onglet ${run.farmTabId} relancé sur ${DM.homePath(s)}`))
+      .catch((e) => DM.log('achat[sw]: relance de l’onglet impossible', e.message));
+  } else {
+    DM.log(`achat[sw]: pas de relance (pilote ${s.enabled ? 'ON' : 'OFF'}, onglet pilote ${s.ownerTabId}, demandeur ${run.farmTabId})`);
+  }
+}
+
+// Onglet d'achat bloqué : on le ferme (la demande sera refaite par le pilote après BUY_RETRY_MS).
+async function buyWatchdog() {
+  const { energyBuy } = await DM.getAll();
+  if (!energyBuy || Date.now() - energyBuy.at < BUY_TAB_MAX_MS) return;
+  DM.log(`achat[sw]: onglet d’achat ${energyBuy.tabId} sans réponse depuis 2 min, fermé`);
+  await chrome.storage.local.set({ energyBuy: null });
+  chrome.tabs.remove(energyBuy.tabId).catch(() => {});
+  await discord('⚠️ Achat d’énergie auto : l’onglet d’achat ne répond pas, fermé. Nouvel essai dans 10 min.', undefined, 'errors');
+}
+
+// Onglet du pilote qui ne répond plus : page qui ne finit jamais de charger (le script de l'extension n'y est pas
+// encore injecté), page d'erreur réseau de Chrome, onglet gelé… → on le recharge (au plus une fois par PONG_MAX_MS).
+const PONG_MAX_MS = 90 * 1000;
+async function pilotWatchdog() {
+  const s = await DM.getAll();
+  if (!s.enabled || s.ownerTabId == null) return;
+  const tabId = s.ownerTabId, now = Date.now();
+  const alive = await chrome.tabs.sendMessage(tabId, { type: 'ping' }).then((r) => !!r?.ok, () => false);
+  const { pilotPong } = await chrome.storage.session.get('pilotPong');
+  if (alive || pilotPong?.tabId !== tabId) return chrome.storage.session.set({ pilotPong: { tabId, at: now } });
+  if (now - pilotPong.at < PONG_MAX_MS) return;
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  const url = tab?.pendingUrl || tab?.url || '';
+  if (!url.startsWith(DM.ORIGIN)) return;   // l'utilisateur a quitté le jeu dans cet onglet : on n'y touche pas
+  await chrome.storage.session.set({ pilotPong: { tabId, at: now } });
+  DM.log(`anti-blocage[sw]: onglet ${tabId} sans réponse depuis ${Math.round((now - pilotPong.at) / 1000)} s → rechargement`);
+  await chrome.storage.local.set({ status: 'Page sans réponse — rechargement…' });
+  chrome.tabs.reload(tabId, { bypassCache: true }).catch(() => {});
+}
+
+async function tickTabs() {
+  const tabs = await chrome.tabs.query({ url: DM.ORIGIN + '/*' });
+  for (const t of tabs) chrome.tabs.sendMessage(t.id, { type: 'tick' }).catch(() => {});
+}
+
+async function setEnabled(on, preferTabId) {
+  if (!on) {
+    await chrome.storage.local.set({ enabled: false, paused: false, bossRun: null, status: 'Arrêté' });
+    return;
+  }
+  let tabId = preferTabId;
+  if (tabId == null) {
+    const tabs = await chrome.tabs.query({ url: DM.ORIGIN + '/*' });
+    tabId = (tabs.find((t) => t.active) || tabs[0])?.id;
+    if (tabId == null) tabId = (await chrome.tabs.create({ url: DM.ORIGIN + DM.homePath(await DM.getAll()) })).id;
+  }
+  await chrome.storage.local.set({ enabled: true, ownerTabId: tabId, pauseReason: null, paused: false, lossStreak: 0, bossRun: null, bossReturn: false, continueDone: false, status: 'Démarrage…' });
+  chrome.tabs.sendMessage(tabId, { type: 'tick' }).catch(() => {});
+}
+
+function ensureAlarm() {
+  chrome.alarms.create('main', { periodInMinutes: 0.5 });
+}
+
+// Nouvelle version sur GitHub ? (au plus une requête toutes les `updateCheckMin` minutes ; 0 = jamais, sauf force)
+async function checkUpdate(force = false) {
+  const { updateCheckedAt = 0, updateCheckMin } = await DM.getAll();
+  const every = Math.max(0, Number(updateCheckMin) || 0) * 60000;
+  if (!force && (!every || Date.now() - updateCheckedAt < every)) return;
+  try {
+    const r = await DM.fetchT(DM.UPDATE_MANIFEST, { cache: 'no-store' }, 15000);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const { version } = await r.json();
+    await chrome.storage.local.set({ updateVersion: version, updateCheckedAt: Date.now() });
+  } catch (e) {
+    await chrome.storage.local.set({ updateCheckedAt: Date.now() });
+    DM.log(`mise à jour : vérification impossible (${e.message})`);
+  }
+}
+
+// ---------- Synchro des mesures de « Rentabilité des zones » (Worker Cloudflare partagé, voir sync-worker/) ----------
+// Envoie les combats de chasse de tes personnages (farmLog) pas encore envoyés (syncPushed : dernier `at` par perso),
+// puis reçoit ceux des autres joueurs depuis le curseur syncSince → farmShared[joueur] (jamais mélangés à farmLog).
+const SYNC_EVERY_MS = 5 * 60000;
+const SYNC_PUSH = 500;            // combats par envoi (limite du Worker)
+const SYNC_SHARED_MAX = 5000;     // combats gardés au plus par joueur partagé
+let syncing = false;
+
+async function farmSync(force = false) {
+  const s = await DM.getAll();
+  const url = (s.syncUrl || '').trim().replace(/\/+$/, '');
+  if (!url || !s.syncKey) return { ok: false, error: 'synchro non configurée (adresse + clé)' };
+  if (syncing || (!force && Date.now() - (s.syncStatus?.at || 0) < SYNC_EVERY_MS)) return { ok: true, skipped: true };
+  syncing = true;
+  const headers = { Authorization: `Bearer ${s.syncKey}`, 'Content-Type': 'application/json' };
+  let sent = 0, got = 0;
+  try {
+    const log = s.farmLog || {}, pushed = { ...(s.syncPushed || {}) };
+    for (const [p, recs] of Object.entries(log)) {
+      const todo = (recs || []).filter((r) => r.at > (pushed[p] || 0));
+      for (let i = 0; i < todo.length; i += SYNC_PUSH) {
+        const chunk = todo.slice(i, i + SYNC_PUSH);
+        const r = await DM.fetchT(`${url}/fights`, { method: 'POST', headers, body: JSON.stringify({ player: p, fights: chunk }) });
+        if (!r.ok) throw new Error(r.status === 401 ? 'clé refusée' : `envoi : HTTP ${r.status}`);
+        pushed[p] = chunk[chunk.length - 1].at;
+        sent += chunk.length;
+        await chrome.storage.local.set({ syncPushed: pushed });
+      }
+    }
+    const mine = new Set([...Object.keys(log), ...Object.keys(pushed)]);
+    const shared = { ...(s.farmShared || {}) };
+    let since = s.syncSince || 0;
+    for (let page = 0; page < 50; page++) {
+      const r = await DM.fetchT(`${url}/fights?since=${since}`, { headers, cache: 'no-store' });
+      if (!r.ok) throw new Error(r.status === 401 ? 'clé refusée' : `réception : HTTP ${r.status}`);
+      const { fights = [], next } = await r.json();
+      for (const { p, r: rec } of fights) {
+        if (mine.has(p) || !rec?.at || !Array.isArray(rec.m)) continue;
+        (shared[p] ||= []).push(rec);
+        got++;
+      }
+      if (!(next > since)) break;
+      since = next;
+    }
+    for (const p of Object.keys(shared)) {
+      if (mine.has(p)) { delete shared[p]; continue; }
+      shared[p] = shared[p].sort((a, b) => a.at - b.at).slice(-SYNC_SHARED_MAX);
+    }
+    // combats par zone, tous joueurs, sans plafond (🧪 échantillonnage) ; Worker d'avant 2.1 : pas de compteurs
+    let syncCounts = s.syncCounts || null;
+    try {
+      const r = await DM.fetchT(`${url}/fights/counts`, { headers, cache: 'no-store' });
+      if (r.ok) syncCounts = { at: Date.now(), zones: (await r.json()).zones || {} };
+    } catch (e) { DM.log(`synchro : compteurs par zone illisibles (${e.message})`); }
+    const syncStatus = { at: Date.now(), ok: true, sent, got, players: Object.keys(shared).length };
+    await chrome.storage.local.set({ farmShared: shared, syncSince: since, syncStatus, syncCounts });
+    return syncStatus;
+  } catch (e) {
+    const syncStatus = { at: Date.now(), ok: false, error: e.message, sent, got };
+    await chrome.storage.local.set({ syncStatus });
+    DM.log(`synchro : ${e.message}`);
+    return syncStatus;
+  } finally {
+    syncing = false;
+  }
+}
+
+// ---------- Enregistrement en ligne des combats (option combatUpload, même Worker et même clé que la synchro) ----------
+// Les onglets du jeu remettent chaque combat terminé (content/combatrec.js) ; file d'attente gardée ici jusqu'à l'envoi
+// (POST /combats), réessayée à chaque alarme. Sans adresse / clé de synchro : les combats restent en file (COMBAT_QUEUE_MAX).
+const COMBAT_QUEUE_MAX = 30;
+const COMBAT_REC_MAX = 1500000;   // taille max d'un combat (JSON), limite du Worker
+let combatChain = Promise.resolve();
+const combatLocked = (fn) => (combatChain = combatChain.then(fn, fn));
+
+function combatEnqueue(rec) {
+  return combatLocked(async () => {
+    const { combatQueue = [] } = await chrome.storage.local.get('combatQueue');
+    if (JSON.stringify(rec).length > COMBAT_REC_MAX) { DM.log(`combat en ligne : combat trop gros, ignoré (${rec.kind})`); return; }
+    if (!combatQueue.some((r) => r.id === rec.id)) combatQueue.push(rec);
+    await chrome.storage.local.set({ combatQueue: combatQueue.slice(-COMBAT_QUEUE_MAX) });
+  });
+}
+
+function combatPush() {
+  return combatLocked(async () => {
+    const s = await DM.getAll();
+    const queue = s.combatQueue || [];
+    if (!queue.length) return;
+    if (s.combatUpload === false) { await chrome.storage.local.set({ combatQueue: [] }); return; }
+    const url = (s.syncUrl || '').trim().replace(/\/+$/, '');
+    if (!url || !s.syncKey) return;
+    const headers = { Authorization: `Bearer ${s.syncKey}`, 'Content-Type': 'application/json' };
+    let sent = 0;
+    try {
+      for (const rec of queue) {
+        const r = await DM.fetchT(`${url}/combats`, { method: 'POST', headers, body: JSON.stringify({ player: rec.player || rec.acct || '?', combat: rec }) });
+        if (!r.ok) throw new Error(r.status === 401 ? 'clé refusée' : r.status === 404 ? 'Worker pas à jour (npx wrangler deploy)' : `HTTP ${r.status}`);
+        sent++;
+      }
+      await chrome.storage.local.set({ combatQueue: [], combatStatus: { at: Date.now(), ok: true, sent, total: (s.combatStatus?.total || 0) + sent } });
+    } catch (e) {
+      await chrome.storage.local.set({ combatQueue: queue.slice(sent),
+        combatStatus: { at: Date.now(), ok: false, error: e.message, sent, total: (s.combatStatus?.total || 0) + sent } });
+      DM.log(`combat en ligne : ${e.message}`);
+    }
+  });
+}
+
+// Tentatives d'Ascension partagées (Worker /asc) : mécaniques vues à un étage par tous les joueurs de la synchro.
+async function ascShared(floor) {
+  const s = await DM.getAll();
+  const url = (s.syncUrl || '').trim().replace(/\/+$/, '');
+  if (!url || !s.syncKey || !(+floor > 0)) return { ok: false, rows: [] };
+  try {
+    const r = await DM.fetchT(`${url}/asc?floor=${+floor}`, { headers: { Authorization: `Bearer ${s.syncKey}` }, cache: 'no-store' });
+    if (!r.ok) return { ok: false, rows: [], error: `HTTP ${r.status}` };
+    return { ok: true, rows: (await r.json()).rows || [] };
+  } catch (e) { return { ok: false, rows: [], error: e.message }; }
+}
+
+// Drops partagés (Worker /drops) : combats de chasse gagnés de tous les joueurs, compacts, à partir de `since`.
+async function dropsShared(since) {
+  const s = await DM.getAll();
+  const url = (s.syncUrl || '').trim().replace(/\/+$/, '');
+  if (!url || !s.syncKey) return { ok: false, error: 'synchro non configurée (adresse + clé, popup de l’extension)' };
+  try {
+    const r = await DM.fetchT(`${url}/drops?since=${Math.max(0, +since || 0)}`, { headers: { Authorization: `Bearer ${s.syncKey}` }, cache: 'no-store' });
+    if (!r.ok) return { ok: false, error: `HTTP ${r.status}` };
+    return { ok: true, ...(await r.json()) };
+  } catch (e) { return { ok: false, error: e.message }; }
+}
+
+chrome.runtime.onInstalled.addListener(async ({ reason }) => {
+  ensureAlarm();
+  checkUpdate(true);
+  // Nouvelle version : les onglets du jeu tournent encore l'ancien script (déconnecté) → on les recharge.
+  if (reason === 'update') {
+    for (const t of await chrome.tabs.query({ url: DM.ORIGIN + '/*' })) chrome.tabs.reload(t.id).catch(() => {});
+  }
+  chrome.storage.local.remove(['fastForward', 'ffArmAt', 'ffTries']);   // ancienne « avance rapide » des combats (retirée en 1.34.0)
+  chrome.storage.local.remove(['lockState', 'lockedItems', 'sellKeepAbove', 'sellKeepRarities', 'dropLockCart']);   // autosell et cadenas (retirés en 2.29.2 : le jeu les gère)
+});
+chrome.runtime.onStartup.addListener(() => { ensureAlarm(); checkUpdate(); });
+
+chrome.alarms.onAlarm.addListener(async (a) => {
+  if (a.name !== 'main') return;
+  checkUpdate();
+  farmSync();
+  combatPush();
+  await bossCheck();
+  await buyWatchdog();
+  await pilotWatchdog();
+  await tickTabs();
+  await updateBadge();
+});
+
+chrome.storage.onChanged.addListener((ch) => {
+  if ('enabled' in ch || 'paused' in ch) updateBadge();
+});
+
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  const { ownerTabId, enabled } = await DM.getAll();
+  if (enabled && ownerTabId === tabId) {
+    await chrome.storage.local.set({ enabled: false, paused: false, status: 'Arrêté : onglet du jeu fermé' });
+  }
+});
+
+// Onglet du jeu dans l'autre contexte que `tab` (un compte en navigation normale, l'autre en navigation privée).
+async function tradePeerTab(tab) {
+  if (!tab) return null;
+  const tabs = (await chrome.tabs.query({ url: DM.ORIGIN + '/*' })).filter((t) => t.incognito !== tab.incognito);
+  return tabs.find((t) => t.active) || tabs[0] || null;
+}
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  (async () => {
+    switch (msg.type) {
+      case 'whoami': return sender.tab?.id ?? null;
+      case 'discord': return discord(msg.text, msg.embeds, msg.kind);
+      case 'toggle': {
+        const { enabled } = await DM.getAll();
+        await setEnabled(!enabled, msg.fromPage ? sender.tab?.id : undefined);
+        return !enabled;
+      }
+      case 'refreshBoss': await refreshBoss(); return true;
+      case 'farmSync': return farmSync(true);
+      case 'ascShared': return ascShared(msg.floor);
+      case 'dropsShared': return dropsShared(msg.since);
+      case 'combatRec': await combatEnqueue({ ...msg.rec, player: msg.rec.player || msg.rec.acct }); combatPush(); return { ok: true };
+      case 'checkUpdate': {   // msg.force : bouton « Vérifier maintenant » ; sinon (ouverture de la popup) seulement si la vérif auto est active
+        const { updateCheckMin } = await DM.getAll();
+        if (msg.force || updateCheckMin > 0) await checkUpdate(true);
+        return true;
+      }
+      case 'reloadExtension': setTimeout(() => chrome.runtime.reload(), 100); return true;
+      case 'openSettings': await chrome.tabs.create({ url: chrome.runtime.getURL('popup.html') }); return true;   // menu 🤖 (téléphone)
+      case 'openUpdate': await chrome.tabs.create({ url: DM.IS_FIREFOX ? DM.RELEASES_URL : chrome.runtime.getURL('update.html') }); return true;
+      case 'bossDone': return bossFinish(msg.result);
+      case 'buyEnergy': return buyStart(sender.tab?.id);
+      case 'buyDone': return buyDone(msg, sender.tab?.id);
+      case 'claim': {   // lien « attaque directe » ouvert dans un nouvel onglet : le pilote actif passe sur cet onglet
+        const { enabled } = await DM.getAll();
+        if (sender.tab?.id == null || (!enabled && !msg.start)) return false;
+        if (!enabled) await setEnabled(true, sender.tab.id);   // « Attaquer » sur un avis : démarre le pilote
+        await chrome.storage.local.set({ ownerTabId: sender.tab.id, paused: false, pauseReason: null, botFight: false,
+          status: msg.status || 'Avis de recherche : attaque du groupe…' });
+        chrome.tabs.sendMessage(sender.tab.id, { type: 'tick' }).catch(() => {});
+        return true;
+      }
+      case 'peerGear':    // optimiseur de build : inventaire du compte « banque » (autre contexte)
+      case 'tradePeer':   // échange HDV : on relaie à un onglet du jeu de l'autre contexte (normal ↔ navigation privée)
+      case 'tradeBuy':
+      case 'tradeVerify': {   // l'autre compte a-t-il bien reçu l'objet ?
+        const peer = await tradePeerTab(sender.tab);
+        if (!peer) {
+          return { ok: false, retry: false, error: sender.tab?.incognito
+            ? 'Aucun onglet DofusMasters ouvert en navigation normale'
+            : 'Aucun onglet DofusMasters en navigation privée (l’extension doit y être autorisée)' };
+        }
+        // onglet en cours de (re)chargement : il répondra dans un instant → le vendeur réessaie
+        return chrome.tabs.sendMessage(peer.id, { ...msg, type: msg.type === 'tradePeer' ? 'tradePing' : msg.type })
+          .catch(() => ({ ok: false, retry: true, error: 'onglet de l’autre compte en cours de chargement' }));
+      }
+    }
+  })().then(sendResponse);
+  return true;
+});
